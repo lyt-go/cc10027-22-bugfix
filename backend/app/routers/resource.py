@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
+from app.services.dedup_window import DedupDeliveryInterrupted
 from app.services.pipeline import pipeline
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -20,6 +21,72 @@ def require_service(module: str):
     if service is None:
         raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
     return service
+
+
+# -- 去重成品 / 采样回执入口 --
+# 注意：这些固定路径必须注册在 /{module}/{entry_id} 之前，避免被动态段抢先匹配。
+
+@router.get("/dedup/batches/{source_key}")
+def list_dedup_batches(source_key: str) -> dict[str, Any]:
+    """列出某日志源已落盘的去重批次及其状态。"""
+    service = require_service("dedup_window")
+    return {"source_key": source_key, "batches": service.list_batches(source_key)}
+
+
+@router.get("/dedup/receipt/{source_key}")
+def get_dedup_receipts(source_key: str, batch_id: str | None = Query(default=None)) -> dict[str, Any]:
+    """读取去重回执：显式批次或最新已确认批次。"""
+    service = require_service("dedup_window")
+    receipt = (
+        service.get_receipt(source_key, batch_id)
+        if batch_id
+        else service.get_latest_receipt(source_key)
+    )
+    if receipt is None:
+        raise HTTPException(status_code=404, detail=f"{source_key} 无已确认的去重回执")
+    return receipt
+
+
+@router.post("/dedup/run/{source_key}")
+def run_dedup(
+    source_key: str,
+    batch_id: str | None = Query(default=None),
+    simulate_disconnect: bool = Query(default=False),
+    force: bool = Query(default=False),
+) -> dict[str, Any]:
+    """执行一次可重跑核对的去重；simulate_disconnect 可在成品落盘后不提交回执。"""
+    service = require_service("dedup_window")
+    try:
+        return service.deduplicate_source(
+            source_key,
+            batch_id,
+            interrupt_after_write=simulate_disconnect,
+            force_rebuild=force,
+        )
+    except DedupDeliveryInterrupted as exc:
+        # 成品已写出，但本次不交付回执：客户端应重送相同输入。
+        raise HTTPException(
+            status_code=503,
+            detail={"message": str(exc), "outcome": exc.result},
+        ) from exc
+
+
+@router.get("/sampling/receipt/{source_key}")
+def get_sampling_receipt(source_key: str, batch_id: str | None = Query(default=None)) -> dict[str, Any]:
+    """读取采样回执：采样基数、采样参数与样本产物身份。"""
+    service = require_service("sampling_rule")
+    return service.get_sampling_stats(source_key, batch_id)
+
+
+@router.post("/sampling/run/{source_key}")
+def run_sampling(
+    source_key: str,
+    batch_id: str | None = Query(default=None),
+    force: bool = Query(default=False),
+) -> dict[str, Any]:
+    """在已核对通过的去重成品上采样。"""
+    service = require_service("sampling_rule")
+    return service.sample_source(source_key, batch_id, force_rebuild=force)
 
 
 @router.get("/{module}", response_model=PageResult[dict])

@@ -211,22 +211,37 @@ class CrossModulePipeline:
         return results
 
     def dedup_sample_pipeline(self, source_key: str) -> dict[str, Any]:
-        """去重+采样管道：窗口去重 -> 采样 -> 格式化输出。"""
+        """去重+采样管道：窗口去重 -> 采样 -> 格式化输出。
+
+        去重结果按批次可重跑核对；采样只读回执核对通过的去重成品。
+        采样未拿到可核对基数时不继续导出，避免产出与回执对不上的样本。
+        """
         started_at = time.time()
         results = {"pipeline": "dedup_sample", "stages": {}}
 
         # 阶段1: 窗口去重
         dedup_r = self.dedup_window.deduplicate_source(source_key)
         results["stages"]["dedup"] = dedup_r
+        if dedup_r.get("error"):
+            results["error"] = dedup_r["error"]
+            results["duration"] = round(time.time() - started_at, 2)
+            return results
 
-        # 阶段2: 采样
-        sample_r = self.sampling_rule.sample_source(source_key)
+        # 阶段2: 采样（仅基于已核对通过的批次成品）
+        sample_r = self.sampling_rule.sample_source(source_key, dedup_r.get("batch_id"))
         results["stages"]["sample"] = sample_r
+        if sample_r.get("error"):
+            results["error"] = sample_r["error"]
+            results["duration"] = round(time.time() - started_at, 2)
+            return results
 
         # 阶段3: 导出采样结果
         export_r = self.format_output.export_source(source_key, "jsonl")
         results["stages"]["output"] = export_r
 
+        results["batch_id"] = dedup_r.get("batch_id")
+        results["dedup_kept"] = dedup_r.get("kept")
+        results["sampled"] = sample_r.get("sampled")
         results["duration"] = round(time.time() - started_at, 2)
         return results
 

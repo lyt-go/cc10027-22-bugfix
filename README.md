@@ -77,5 +77,21 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+### 去重成品与采样回执
+
+- 一次去重按输入内容生成批次号 `BATCH-<摘要>`；同一份输入重跑/重送只会复用同一批次，
+  不会把已确认的保留行再次追加。
+- 每个批次的成品与回执落在 `data/logs/batches/<源>/<批次>/`：
+  `deduped.jsonl`（成品）、`receipt.json`（回执）、`manifest.json`（成品身份旁证）、
+  `sampled.jsonl` / `sample_receipt.json`（采样）。
+  回执中的保留数、保留行号范围与成品行数、摘要必须互相核对通过。
+- 成品先原子整写、回执后提交。若写出后响应断开（`POST /api/dedup/run/{源}?simulate_disconnect=true`
+  返回 503），重送相同输入会从 manifest 恢复同一份回执，而不是重新追加数据。
+- 采样只消费“已核对成品 + 已确认回执”，回执记录采样基数（批次、输入摘要、保留数与行范围）
+  与样本产物身份（摘要、行号）；同一批次采样幂等。
+- 新批次各自计算保留集，旧批次成品与回执原样保留；晚到的旧批次重送不会替换磁盘上的最新成品。
+  相关入口：`GET /api/dedup/batches/{源}`、`GET /api/dedup/receipt/{源}`、
+  `POST /api/dedup/run/{源}`、`POST /api/sampling/run/{源}`、`GET /api/sampling/receipt/{源}`。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

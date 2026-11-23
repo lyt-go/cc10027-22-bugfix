@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,15 @@ from typing import Any
 from app.store import store
 
 DATA_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "data"
+
+_SOURCE_LOCKS: dict[str, threading.RLock] = {}
+_SOURCE_LOCKS_GUARD = threading.Lock()
+
+
+def source_lock(source_key: str) -> threading.RLock:
+    """同一日志源的成品读写串行化，避免重送与采样读到半份文件。"""
+    with _SOURCE_LOCKS_GUARD:
+        return _SOURCE_LOCKS.setdefault(source_key, threading.RLock())
 
 
 def _ensure_dir(path: Path) -> None:
@@ -107,6 +117,7 @@ class BaseModuleService:
         return p
 
     def _write_jsonl(self, filepath: Path, records: list[dict[str, Any]]) -> int:
+        """追加写入 JSONL。只用于日志类流水；可核对成品请用原子整写。"""
         _ensure_dir(filepath.parent)
         written = 0
         with open(filepath, "a", encoding="utf-8") as f:
@@ -114,6 +125,67 @@ class BaseModuleService:
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
                 written += 1
         return written
+
+    @staticmethod
+    def _jsonl_bytes(records: list[dict[str, Any]]) -> bytes:
+        return "".join(
+            json.dumps(rec, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+            for rec in records
+        ).encode("utf-8")
+
+    def _write_jsonl_atomic(self, filepath: Path, records: list[dict[str, Any]]) -> int:
+        """整份替换写入 JSONL：先写同目录临时文件再原子替换。
+
+        重跑或重送时不会在旧成品后面追加，文件内容始终只对应本次输入。
+        """
+        _ensure_dir(filepath.parent)
+        payload = self._jsonl_bytes(records)
+        tmp = filepath.with_name(f".{filepath.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            with open(tmp, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, filepath)
+        finally:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+        return len(records)
+
+    def _write_json_atomic(self, filepath: Path, payload: dict[str, Any]) -> Path:
+        _ensure_dir(filepath.parent)
+        tmp = filepath.with_name(f".{filepath.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, filepath)
+        finally:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+        return filepath
+
+    @staticmethod
+    def _digest_payload(payload: Any) -> str:
+        canonical = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _digest_bytes(payload: bytes) -> str:
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    def _read_json(self, filepath: Path) -> dict[str, Any] | None:
+        if not filepath.exists():
+            return None
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
 
     def _read_jsonl(self, filepath: Path) -> list[dict[str, Any]]:
         if not filepath.exists():
@@ -146,6 +218,14 @@ class BaseModuleService:
 
     def _compute_checksum(self, content: str) -> str:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _relpath(path: Path) -> str:
+        """把数据目录内的绝对路径转成相对路径，便于回执跨环境核对。"""
+        try:
+            return str(path.relative_to(DATA_ROOT))
+        except ValueError:
+            return str(path)
 
     def _collect_sources(self) -> list[dict[str, Any]]:
         """从 store 和文件系统中收集所有活跃的日志源。"""
